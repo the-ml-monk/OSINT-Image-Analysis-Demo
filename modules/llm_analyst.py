@@ -8,38 +8,43 @@ import os
 import json
 import requests
 
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-GROQ_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
-GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+# Gemini if GEMINI_API_KEY is set, else Groq (modules/llm_provider.py). The names are
+# kept from the Groq-only version so the calls below read as before.
+from modules.llm_provider import LLM_KEY as GROQ_API_KEY, LLM_URL as GROQ_URL, LLM_MODEL, LLM_EXTRA
+GROQ_MODEL = LLM_MODEL
 
 
 def generate_report(
     exif_data: dict,
     vision_data: dict,
     identity_matches: list = None,
-    filename: str = "uploaded_image"
+    filename: str = "uploaded_image",
+    risk_level: str = None
 ) -> str:
     """
     Generate a structured intelligence report from all extracted findings.
     Returns formatted markdown text.
     """
     if not GROQ_API_KEY:
-        return "_LLM not configured — set GROQ_API_KEY in .env_"
+        return "_LLM not configured — set GEMINI_API_KEY (or GROQ_API_KEY) in .env_"
 
     # Build a condensed facts sheet for the LLM
     facts = _build_facts(exif_data, vision_data, identity_matches, filename)
 
-    system_prompt = """You are an OSINT image analyst. Produce a SHORT, punchy intelligence briefing.
+    risk_line = f"The data in this photo has already been scored {risk_level}. Use EXACTLY this level — do not lower it." if risk_level else ""
+    system_prompt = f"""You are a privacy-exposure analyst for a public security-awareness session.
+Your job is to show an ordinary person HOW MUCH a single photo they posted gives away about them —
+their location, routine, home, family, devices and interests. You are NOT assessing a military/combat threat;
+even a happy family photo can be HIGH risk because of what it exposes.
 
 Rules:
-- MAX 120 words total — be ruthlessly concise
-- Use bullet points, not paragraphs
-- Structure: **What** (scene), **Who** (people count/type), **Where** (GPS/venue), **When** (timestamp), **Risk** (CRITICAL/HIGH/MEDIUM/LOW + one-line reason)
-- Skip sections with no findings — don't say "no data available"
-- No filler words or disclaimers
-- Bold the most important findings"""
+- MAX 110 words. Bullet points, not paragraphs. Bold the most exposing findings.
+- Structure: **What** (scene) · **Who** (people — count and any public figure named) · **Where** (the NAMED place if given, else GPS) · **When** (use the LOCAL capture time exactly as given — never relabel it UTC) · **Exposed** (2-3 concrete things an attacker/stalker learns) · **Risk** (level + one-line reason).
+{risk_line}
+- Frame "Exposed" as what a STRANGER now knows: e.g. "exact building and time they were there", "the phone model and iOS version to target", "a child's school from a uniform".
+- No disclaimers, no filler."""
 
-    user_prompt = f"""Brief this image — "{filename}":
+    user_prompt = f"""Brief this image for a privacy-awareness audience — "{filename}":
 
 {facts}"""
 
@@ -57,9 +62,10 @@ Rules:
                     {"role": "user", "content": user_prompt}
                 ],
                 "temperature": 0.2,
+                **LLM_EXTRA,
                 "max_tokens": 400
             },
-            timeout=20
+            timeout=60
         )
         resp.raise_for_status()
         data = resp.json()
@@ -122,9 +128,10 @@ Focus queries on:
                 "model": GROQ_MODEL,
                 "messages": [{"role": "user", "content": prompt}],
                 "temperature": 0.2,
+                **LLM_EXTRA,
                 "max_tokens": 300
             },
-            timeout=15
+            timeout=45
         )
         resp.raise_for_status()
         text = resp.json()["choices"][0]["message"]["content"].strip()
@@ -158,8 +165,12 @@ def _build_facts(exif_data, vision_data, identity_matches, filename) -> str:
                 lines.append(f"- Software: {device['software']}")
         if exif_data.get("datetime"):
             lines.append(f"- Capture time: {exif_data['datetime']}")
+        if exif_data.get("datetime_local"):
+            lines.append(f"- Capture time (LOCAL): {exif_data['datetime_local']}")
         gps = exif_data.get("gps")
         if gps and "latitude" in gps:
+            if gps.get("place"):
+                lines.append(f"- NAMED LOCATION: {gps['place']}")
             lines.append(f"- GPS: {gps['latitude']}, {gps['longitude']}")
             if gps.get("altitude_m"):
                 lines.append(f"- Altitude: {gps['altitude_m']}m")
@@ -185,8 +196,7 @@ def _build_facts(exif_data, vision_data, identity_matches, filename) -> str:
 
     faces = vision_data.get("faces", [])
     if faces:
-        face_desc = ", ".join([f"~{f.get('age','?')}y {f.get('gender','?')}" for f in faces])
-        lines.append(f"- Faces detected: {len(faces)} ({face_desc})")
+        lines.append(f"- Faces detected: {len(faces)} identifiable face(s) — each one reverse-searchable")
 
     landmarks = vision_data.get("landmarks", [])
     if landmarks:

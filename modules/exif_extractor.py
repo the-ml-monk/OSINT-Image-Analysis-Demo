@@ -107,6 +107,14 @@ def extract_exif(file_path: str) -> dict:
         if val:
             result["device"][key] = str(val)
 
+    # --- Timezone offset (iPhone/modern cameras store local time + offset) ---
+    tz_offset = None
+    for off_tag in ["EXIF OffsetTimeOriginal", "EXIF OffsetTime", "EXIF OffsetTimeDigitized"]:
+        if off_tag in tags:
+            tz_offset = str(tags[off_tag]).strip()
+            break
+    result["tz_offset"] = tz_offset
+
     # --- DateTime ---
     for dt_tag in ["EXIF DateTimeOriginal", "EXIF DateTimeDigitized", "Image DateTime"]:
         if dt_tag in tags:
@@ -116,6 +124,14 @@ def extract_exif(file_path: str) -> dict:
             except Exception:
                 result["datetime"] = str(tags[dt_tag])
             break
+
+    if result["datetime"]:
+        # The capture time in EXIF DateTimeOriginal is the phone's LOCAL time, not UTC.
+        label = result["datetime"].replace("T", " ")
+        if result.get("tz_offset"):
+            result["datetime_local"] = f"{label} (local, UTC{result['tz_offset']})"
+        else:
+            result["datetime_local"] = f"{label} (camera local time)"
 
     # --- GPS Extraction ---
     gps_lat = tags.get("GPS GPSLatitude")

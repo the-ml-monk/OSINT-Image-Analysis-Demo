@@ -7,3 +7,7 @@ reports/
 sample_data/
 *.DS_Store
 /tmp/
+.env.*
+*.bak
+CLEANED_*
+!.env.example

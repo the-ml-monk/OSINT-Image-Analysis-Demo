@@ -20,12 +20,44 @@ except ImportError:
 VISION_ENDPOINT = os.getenv("AZURE_VISION_ENDPOINT", "").rstrip("/")
 VISION_KEY = os.getenv("AZURE_VISION_KEY", "")
 
+# (connect_timeout, read_timeout) — tuple lets us fail fast on connect while
+# giving the Azure API enough time to process the image on the read side.
+_TIMEOUT = (10, 60)
+
 
 def _get_headers():
     return {
         "Ocp-Apim-Subscription-Key": VISION_KEY,
         "Content-Type": "application/octet-stream"
     }
+
+
+def _post_with_retry(url, headers=None, params=None, data=None, max_attempts=3):
+    """POST to Azure Vision with 3 attempts and exponential backoff."""
+    import time
+    last_err = None
+    for attempt in range(max_attempts):
+        try:
+            return requests.post(url, headers=headers, params=params, data=data, timeout=_TIMEOUT)
+        except (requests.Timeout, requests.ConnectionError) as e:
+            last_err = e
+            if attempt < max_attempts - 1:
+                time.sleep(1.5 * (attempt + 1))
+    raise last_err
+
+
+def _get_with_retry(url, headers=None, max_attempts=3):
+    """GET from Azure Vision with 3 attempts and exponential backoff."""
+    import time
+    last_err = None
+    for attempt in range(max_attempts):
+        try:
+            return requests.get(url, headers=headers, timeout=_TIMEOUT)
+        except (requests.Timeout, requests.ConnectionError) as e:
+            last_err = e
+            if attempt < max_attempts - 1:
+                time.sleep(1.0 * (attempt + 1))
+    raise last_err
 
 
 def _read_image_bytes(file_path: str) -> bytes:
@@ -104,7 +136,7 @@ def analyse_image(file_path: str) -> dict:
         "language": "en"
     }
     try:
-        resp = requests.post(analyze_url, headers=_get_headers(), params=params, data=image_data, timeout=30)
+        resp = _post_with_retry(analyze_url, headers=_get_headers(), params=params, data=image_data)
         resp.raise_for_status()
         data = resp.json()
 
@@ -197,7 +229,7 @@ def extract_text(file_path: str) -> dict:
     # Submit read job
     read_url = f"{VISION_ENDPOINT}/vision/v3.2/read/analyze"
     try:
-        resp = requests.post(read_url, headers=_get_headers(), data=image_data, timeout=30)
+        resp = _post_with_retry(read_url, headers=_get_headers(), data=image_data)
         resp.raise_for_status()
         operation_url = resp.headers.get("Operation-Location")
         if not operation_url:
@@ -213,7 +245,7 @@ def extract_text(file_path: str) -> dict:
     for _ in range(15):
         time.sleep(1)
         try:
-            poll = requests.get(operation_url, headers=poll_headers, timeout=15)
+            poll = _get_with_retry(operation_url, headers=poll_headers)
             poll.raise_for_status()
             poll_data = poll.json()
             status = poll_data.get("status")
@@ -297,9 +329,9 @@ def enhanced_ocr(file_path: str) -> dict:
     params = {"readingOrder": "natural"}
 
     try:
-        resp = requests.post(
+        resp = _post_with_retry(
             read_url, headers=_get_headers(),
-            params=params, data=image_data, timeout=30
+            params=params, data=image_data
         )
         resp.raise_for_status()
         operation_url = resp.headers.get("Operation-Location")
@@ -316,7 +348,7 @@ def enhanced_ocr(file_path: str) -> dict:
     for _ in range(20):
         time.sleep(1)
         try:
-            poll = requests.get(operation_url, headers=poll_headers, timeout=15)
+            poll = _get_with_retry(operation_url, headers=poll_headers)
             poll.raise_for_status()
             poll_data = poll.json()
             if poll_data.get("status") == "succeeded":

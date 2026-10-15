@@ -22,6 +22,8 @@ from modules.azure_vision import (
 )
 from modules.video_analyser import analyse_video, get_video_metadata
 from modules.llm_analyst import generate_report
+from modules.llm_provider import PROVIDER, LLM_KEY, check_llm
+from modules.geo import place_name
 from modules.identity_lookup import identify_people_via_vision, corroborate_identity, chat_about_image
 
 # ── Page config ──────────────────────────────────────────────────────────────
@@ -35,20 +37,31 @@ st.set_page_config(
 # ── Styling — compact layout ──────────────────────────────────────────────────
 st.markdown("""
 <style>
-    /* Tighten global spacing */
-    .block-container { padding-top: 1rem !important; padding-bottom: 0 !important; max-width: 100% !important; }
-    section[data-testid="stSidebar"] { width: 220px !important; }
-    h1 { font-size: 1.5rem !important; margin-bottom: 0.3rem !important; }
-    h2, h3 { font-size: 1.1rem !important; margin-top: 0.5rem !important; margin-bottom: 0.2rem !important; }
-    p, li, .stMarkdown { font-size: 0.88rem !important; }
-    .stMetric { padding: 0.3rem 0 !important; }
-    .stMetric label { font-size: 0.75rem !important; }
-    .stMetric [data-testid="stMetricValue"] { font-size: 1.1rem !important; }
-    div[data-testid="stExpander"] { margin-top: 0.2rem !important; margin-bottom: 0.2rem !important; }
-    .stDivider { margin: 0.4rem 0 !important; }
-    .stCaption { font-size: 0.76rem !important; }
-    pre, code { font-size: 0.8rem !important; padding: 4px 8px !important; }
-    .stChatMessage { padding: 0.4rem 0.6rem !important; }
+    /* Aggressive compaction — fit more on screen */
+    html { font-size: 13px !important; }
+    .block-container { padding: 1.2rem 1rem 0 1rem !important; max-width: 100% !important; }
+    section[data-testid="stSidebar"] { width: 200px !important; }
+    section[data-testid="stSidebar"] .block-container { padding: 0.5rem !important; }
+    h1, .main h1, .main .stMarkdown h1 { font-size: 1.4rem !important; margin: 0.4rem 0 0.4rem 0 !important; line-height: 1.3 !important; }
+    h2, h3 { font-size: 1rem !important; margin: 0.4rem 0 0.2rem 0 !important; }
+    p, li, .stMarkdown, .stMarkdown p { font-size: 0.8rem !important; margin-bottom: 0.2rem !important; }
+    .stMetric { padding: 0.2rem 0 !important; }
+    .stMetric label { font-size: 0.7rem !important; }
+    .stMetric [data-testid="stMetricValue"] { font-size: 1rem !important; }
+    div[data-testid="stExpander"] { margin: 0.15rem 0 !important; }
+    div[data-testid="stExpander"] summary { font-size: 0.8rem !important; padding: 0.3rem 0.5rem !important; }
+    hr, .stDivider { margin: 0.25rem 0 !important; }
+    .stCaption { font-size: 0.7rem !important; }
+    pre, code { font-size: 0.72rem !important; padding: 3px 6px !important; line-height: 1.3 !important; }
+    .stChatMessage { padding: 0.3rem 0.5rem !important; }
+    .stChatInput { padding: 0.2rem !important; }
+    div[data-testid="stFileUploader"] { padding: 0.3rem !important; }
+    div[data-testid="stFileUploader"] section { padding: 0.5rem !important; min-height: 50px !important; }
+    div[data-testid="stFileUploader"] small { font-size: 0.7rem !important; }
+    button { font-size: 0.78rem !important; padding: 0.25rem 0.6rem !important; }
+    [data-testid="column"] { padding: 0 0.25rem !important; }
+    [data-testid="stImage"] img { max-height: 400px !important; width: 100% !important; object-fit: contain !important; }
+    .stSpinner { font-size: 0.75rem !important; }
 
     /* Risk badges */
     .risk-critical { background:#ff4b4b; color:white; padding:3px 10px; border-radius:4px; font-weight:bold; font-size:0.8rem; }
@@ -61,6 +74,23 @@ st.markdown("""
     .ocr-enhanced  { border:1px solid #4a90d9; border-radius:6px; padding:8px; background:#f0f6ff; }
 </style>
 """, unsafe_allow_html=True)
+
+
+# ── Access ────────────────────────────────────────────────────────────────────
+# Online, a password keeps strangers from using the Vision and Gemini keys. On a
+# laptop APP_PASSWORD is not set and the app opens straight away.
+_APP_PASSWORD = os.getenv("APP_PASSWORD", "")
+if _APP_PASSWORD and not st.session_state.get("authed"):
+    import hmac
+    st.markdown("## Image Analysis Demo")
+    st.caption("Security awareness demonstration — enter the password to continue.")
+    _entered = st.text_input("Password", type="password")
+    if _entered:
+        if hmac.compare_digest(_entered, _APP_PASSWORD):
+            st.session_state.authed = True
+            st.rerun()
+        st.error("Wrong password.")
+    st.stop()
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -86,6 +116,62 @@ def save_upload(uploaded_file) -> str:
     return tmp.name
 
 
+# ── Cached analysis ───────────────────────────────────────────────────────────
+# In Streamlit the whole script re-runs on EVERY interaction (including a chat
+# message). Without caching, each chat question silently re-ran the entire Azure
+# Vision + Gemini + geocode pipeline before answering — the ~30s freeze. These
+# wrappers are keyed by the image bytes, so the heavy work runs once per image
+# and a chat message only runs the chat call. Args prefixed "_" are passed but
+# not used in the cache key.
+def _bytes_to_tmp(file_bytes, name):
+    suffix = os.path.splitext(name)[-1].lower() or ".jpg"
+    t = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    t.write(file_bytes); t.close()
+    return t.name
+
+@st.cache_data(show_spinner=False, max_entries=20)
+def cached_exif(file_bytes, name):
+    tp = _bytes_to_tmp(file_bytes, name)
+    try: return extract_exif(tp)
+    finally:
+        try: os.remove(tp)
+        except Exception: pass
+
+@st.cache_data(show_spinner=False, max_entries=20)
+def cached_vision(file_bytes, name):
+    return analyse_image_from_bytes(file_bytes, name)
+
+@st.cache_data(show_spinner=False, max_entries=20)
+def cached_enhanced_ocr(file_bytes, name):
+    tp = _bytes_to_tmp(file_bytes, name)
+    try: return enhanced_ocr(tp)
+    finally:
+        try: os.remove(tp)
+        except Exception: pass
+
+@st.cache_data(show_spinner=False, max_entries=20)
+def cached_identity(file_bytes, name, _vision):
+    tp = _bytes_to_tmp(file_bytes, name)
+    try: return identify_people_via_vision(tp, vision_context=_vision)
+    finally:
+        try: os.remove(tp)
+        except Exception: pass
+
+@st.cache_data(show_spinner=False, max_entries=50)
+def cached_place(lat, lon):
+    return place_name(lat, lon)
+
+@st.cache_data(show_spinner=False, max_entries=50)
+def cached_corroborate(name, role=""):
+    return corroborate_identity(name, role)
+
+@st.cache_data(show_spinner=False, max_entries=20)
+def cached_report(file_bytes, name, risk_level, _exif, _vision, _identity_matches):
+    return generate_report(exif_data=_exif, vision_data=_vision,
+                           identity_matches=_identity_matches, filename=name,
+                           risk_level=risk_level)
+
+
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.title("Image Analysis Demo")
@@ -109,11 +195,18 @@ with st.sidebar:
     else:
         st.error("Vision AI: Not configured")
 
-    # Groq LLM
-    if os.getenv("GROQ_API_KEY"):
-        st.success("LLM (Groq): Connected")
+    # AI model — Gemini or Groq; asked whether the key really works (it used to say
+    # "Connected" for any key filled in, even a dead one).
+    @st.cache_data(ttl=300, show_spinner=False)
+    def _llm_status():
+        return check_llm()
+    llm_ok, llm_msg = _llm_status()
+    if llm_ok:
+        st.success(f"AI ({PROVIDER}): Connected · {llm_msg}")
+    elif PROVIDER:
+        st.error(f"AI ({PROVIDER}): {llm_msg}")
     else:
-        st.warning("LLM: Not configured")
+        st.warning("AI: Not configured")
 
     # Serper
     if os.getenv("SERPER_API_KEY"):
@@ -128,6 +221,8 @@ with st.sidebar:
 # ── Page heading ─────────────────────────────────────────────────────────────
 st.markdown("## Image Analysis Demo")
 st.caption("AI-powered media intelligence & privacy awareness tool")
+st.warning("Demo only — please use staged photos, not personal ones. Every image you upload is sent to "
+           "Azure (India) and Google for analysis: exactly the kind of sharing this session warns about.")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # MODE 1 — IMAGE ANALYSIS
@@ -141,10 +236,11 @@ if mode == "Image Analysis":
 
     if uploaded:
         uploaded.seek(0)
+        file_bytes = uploaded.getvalue()
         tmp_path = save_upload(uploaded)
 
         with st.spinner("Extracting metadata..."):
-            exif = extract_exif(tmp_path)
+            exif = cached_exif(file_bytes, uploaded.name)
 
         import pandas as pd
         gps = exif.get("gps")
@@ -165,10 +261,17 @@ if mode == "Image Analysis":
             st.caption(f"{uploaded.name} · {round(uploaded.size/1024, 1)} KB")
 
         with col_meta:
-            st.markdown(f"**Risk:** {risk_badge(risk)}", unsafe_allow_html=True)
+            st.markdown(f"**Metadata risk:** {risk_badge(risk)}", unsafe_allow_html=True)
             if device:
                 st.write(f"**Device:** {device.get('make','')} {device.get('model','')}")
-            if dt:
+                if device.get("software"):
+                    sw = device["software"]
+                    # iPhones store just the number ("17.0.1"); label it so the point lands.
+                    label = f"iOS {sw}" if sw[:1].isdigit() and device.get("make","").lower().startswith("apple") else sw
+                    st.write(f"**Software:** {label}")
+            if exif.get("datetime_local"):
+                st.write(f"**Captured:** {exif['datetime_local']}")
+            elif dt:
                 st.write(f"**Captured:** {dt}")
             if has_gps:
                 st.code(f"{gps['latitude']}, {gps['longitude']}  alt:{gps.get('altitude_m','?')}m", language=None)
@@ -182,6 +285,47 @@ if mode == "Image Analysis":
         if has_gps:
             with col_map:
                 st.map(pd.DataFrame({"lat": [gps["latitude"]], "lon": [gps["longitude"]]}), zoom=14, height=220)
+            with st.spinner("Resolving the coordinates to a real place..."):
+                place = cached_place(gps["latitude"], gps["longitude"])
+            if place.get("short"):
+                gps["place"] = place.get("display_name") or place["short"]
+                st.error(f"📍 **These coordinates resolve to:** {place['short']}  \n"
+                         f"<small>{place.get('display_name','')}</small>", icon="📍")
+                st.markdown(f"<small>{place.get('display_name','')}</small>", unsafe_allow_html=True)
+
+        # ── Download a CLEANED copy (the fix: strip every hidden tag) ──────────
+        try:
+            from PIL import Image as _PILImage
+            import io as _io
+            _clean = _PILImage.open(tmp_path).convert("RGB")
+            _buf = _io.BytesIO()
+            _clean.save(_buf, format="JPEG", quality=92)  # re-encoding drops EXIF/GPS
+            st.download_button(
+                "⬇️ Download a clean copy (location & metadata removed)",
+                data=_buf.getvalue(),
+                file_name=f"CLEANED_{os.path.splitext(uploaded.name)[0]}.jpg",
+                mime="image/jpeg",
+                help="This is the safe version to share — all GPS and device tags are gone."
+            )
+        except Exception:
+            pass
+
+        # ── Headline: what a stranger learns from THIS one photo ──────────────
+        reveals = []
+        if has_gps and gps.get("place"):
+            reveals.append(f"📍 **Exactly where you were** — {gps['place'].split(',')[0]}" +
+                           (f", {gps['place'].split(',')[1].strip()}" if ',' in gps['place'] else ""))
+        elif has_gps:
+            reveals.append(f"📍 **Exact coordinates** — {gps['latitude']}, {gps['longitude']}")
+        if exif.get("datetime_local"):
+            reveals.append(f"🕒 **When you were there** — {exif['datetime_local']}")
+        if device.get("model"):
+            sw = device.get("software", "")
+            swlabel = f", iOS {sw}" if sw[:1].isdigit() and device.get('make','').lower().startswith('apple') else (f" ({sw})" if sw else "")
+            reveals.append(f"📱 **Your device** — {device.get('make','')} {device.get('model','')}{swlabel}")
+        if reveals:
+            st.markdown("#### 🔎 What this one photo just told a stranger")
+            st.error("  \n".join(reveals))
 
         # Raw EXIF (collapsed)
         raw = exif.get("raw_tags", {})
@@ -197,8 +341,7 @@ if mode == "Image Analysis":
             st.error("Vision AI not configured in .env")
         else:
             with st.spinner("Running Vision AI..."):
-                uploaded_file_bytes = open(tmp_path, "rb").read()
-                vision = analyse_image_from_bytes(uploaded_file_bytes, uploaded.name)
+                vision = cached_vision(file_bytes, uploaded.name)
 
             if vision.get("errors"):
                 for err in vision["errors"]:
@@ -222,11 +365,12 @@ if mode == "Image Analysis":
             with col_v2:
                 faces = vision.get("faces", [])
                 if faces:
-                    face_str = ", ".join([f"~{f.get('age','?')}y {f.get('gender','?')}" for f in faces])
-                    st.markdown(f"**Faces ({len(faces)}):** {face_str} {risk_badge('HIGH')}", unsafe_allow_html=True)
+                    st.markdown(f"**Faces:** {len(faces)} detected — each one reverse-searchable {risk_badge('HIGH')}", unsafe_allow_html=True)
                 objects = vision.get("objects", [])
                 if objects:
-                    st.markdown("**Objects:** " + ", ".join([o['object'] for o in objects]))
+                    from collections import Counter as _Counter
+                    _oc = _Counter(o['object'] for o in objects)
+                    st.markdown("**Objects:** " + ", ".join(f"{k} ×{v}" if v > 1 else k for k, v in _oc.items()))
 
             with col_v3:
                 brands = vision.get("brands", [])
@@ -242,35 +386,63 @@ if mode == "Image Analysis":
 
             if vision and should_enhanced_ocr(vision):
                 with st.spinner("Enhanced OCR..."):
-                    enhanced_ocr_result = enhanced_ocr(tmp_path)
+                    enhanced_ocr_result = cached_enhanced_ocr(file_bytes, uploaded.name)
                 if enhanced_ocr_result and not enhanced_ocr_result.get("error"):
                     blocks = enhanced_ocr_result.get("text_blocks", [])
                     full = enhanced_ocr_result.get("full_text", "")
                     words = enhanced_ocr_result.get("words", [])
                     n_words = len(words)
-                    with st.expander(f"Extracted Text — {n_words} words {risk_badge('HIGH')}", expanded=bool(blocks)):
+                    with st.expander(f"Extracted Text — {n_words} words read off the image · 🔴 HIGH", expanded=(n_words <= 40)):
                         for block in blocks:
                             st.code(block["text"], language=None)
                         if n_words:
                             avg_conf = sum(w.get("confidence", 0) for w in words) / n_words
                             st.caption(f"{n_words} words · {avg_conf:.0%} avg confidence")
             elif ocr_lines:
-                with st.expander(f"Extracted Text — {len(ocr_lines)} lines {risk_badge('HIGH' if len(ocr_lines) > 2 else 'MEDIUM')}", expanded=True):
+                with st.expander(f"Extracted Text — {len(ocr_lines)} lines · {'🔴 HIGH' if len(ocr_lines) > 2 else '🟠 MEDIUM'}", expanded=(len(ocr_lines) <= 8)):
                     for line in ocr_lines:
                         st.code(line, language=None)
 
         # ── Identity & Context Recognition ──────────────────────────────────
         identity_result = None
-        if vision and os.getenv("GROQ_API_KEY"):
+        if vision and LLM_KEY:
             st.divider()
             st.subheader("Context & Personnel Analysis")
 
             with st.spinner("Vision AI scanning for badges, insignia, banners, text..."):
-                identity_result = identify_people_via_vision(tmp_path, vision_context=vision)
+                identity_result = cached_identity(file_bytes, uploaded.name, vision)
 
             if identity_result.get("error"):
                 st.warning(identity_result["error"])
             else:
+                # Public figures — grounded in readable text, then searched by NAME on the web.
+                figs = identity_result.get("public_figures", [])
+                if figs:
+                    st.markdown("**🌐 Public figure(s) identified**")
+                    for fig in figs:
+                        nm = fig.get("name", "")
+                        if not nm:
+                            continue
+                        st.markdown(f'<div class="identity-card">**{nm}** — {fig.get("note","")}  \n'
+                                    f'<small>Basis: {fig.get("basis","")}</small></div>', unsafe_allow_html=True)
+                        if os.getenv("SERPER_API_KEY"):
+                            with st.spinner(f"Searching the web for: {nm}"):
+                                corr = cached_corroborate(nm, fig.get("note", ""))
+                            news = corr.get("news", [])[:3]
+                            if news:
+                                for item in news:
+                                    st.markdown(f"- [{item['title']}]({item['link']})")
+                            ref_imgs = corr.get("images", [])[:3]
+                            if ref_imgs:
+                                cols = st.columns(len(ref_imgs))
+                                for idx, img in enumerate(ref_imgs):
+                                    with cols[idx]:
+                                        try:
+                                            st.image(img["imageUrl"], use_container_width=True)
+                                        except Exception:
+                                            pass
+                    st.caption("Grounded in text/public status — not face-matching of private people.")
+
                 col_id1, col_id2 = st.columns(2)
 
                 with col_id1:
@@ -299,7 +471,7 @@ if mode == "Image Analysis":
                             # Corroborate names found on badges
                             if badge_text and badge_text != "null" and os.getenv("SERPER_API_KEY"):
                                 with st.spinner(f"Searching: {badge_text}"):
-                                    corr = corroborate_identity(badge_text, role)
+                                    corr = cached_corroborate(badge_text, role)
                                 kg = corr.get("knowledge_graph")
                                 if kg and kg.get("title"):
                                     st.write(f"**Match:** {kg['title']} — {kg.get('type','')}")
@@ -350,7 +522,7 @@ if mode == "Image Analysis":
                 event = identity_result.get("event_identified")
                 if event and event.get("name") and os.getenv("SERPER_API_KEY"):
                     with st.spinner(f"Searching: {event['name']}"):
-                        corr = corroborate_identity(event["name"])
+                        corr = cached_corroborate(event["name"])
                     news = corr.get("news", [])
                     if news:
                         st.markdown(f"**Event Coverage ({len(news)} results)**")
@@ -363,7 +535,7 @@ if mode == "Image Analysis":
                     st.info(extra)
 
         # ── LLM Intelligence Briefing ────────────────────────────────────────
-        if vision and os.getenv("GROQ_API_KEY"):
+        if vision and LLM_KEY:
             st.divider()
             st.subheader("Intelligence Briefing")
 
@@ -374,12 +546,18 @@ if mode == "Image Analysis":
                     identity_matches.append({"title": name, "link": "#", "snippet": p.get("role_inference", "")})
 
             with st.spinner("Generating briefing..."):
-                report = generate_report(exif_data=exif, vision_data=vision,
-                                         identity_matches=identity_matches, filename=uploaded.name)
+                # Overall exposure = worst of metadata risk and content risk.
+                _order = {"LOW": 0, "LOW-MEDIUM": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}
+                overall = risk
+                _content_high = bool(vision.get("faces")) or len(vision.get("ocr_text", []) or []) >= 3 \
+                    or (identity_result and (identity_result.get("public_figures") or identity_result.get("people_identified")))
+                if _content_high and _order.get(overall, 0) < _order["HIGH"]:
+                    overall = "HIGH"
+                report = cached_report(file_bytes, uploaded.name, overall, exif, vision, identity_matches)
             st.markdown(report)
 
         # ── Image Chatbot ────────────────────────────────────────────────────
-        if os.getenv("GROQ_API_KEY"):
+        if LLM_KEY:
             st.divider()
             st.subheader("Ask About This Image")
             st.caption("Chat with AI about the uploaded image — ask about people, objects, text, context, or anything visible")
@@ -554,7 +732,7 @@ elif mode == "Video Analysis":
                 st.write(obj_str)
 
             # LLM report on video
-            if os.getenv("GROQ_API_KEY"):
+            if LLM_KEY:
                 st.divider()
                 st.subheader("AI Intelligence Briefing")
                 # Build a synthetic vision dict from aggregated
@@ -630,9 +808,6 @@ elif mode == "Bulk Image Scan":
 
         for i, f in enumerate(uploaded_files):
             status_text.text(f"Processing {f.name} ({i+1}/{len(uploaded_files)})...")
-            f.seek(0)
-            tmp = save_upload(f)
-
             row = {
                 "Filename": f.name,
                 "Size (KB)": round(f.size / 1024, 1),
@@ -647,40 +822,52 @@ elif mode == "Bulk Image Scan":
                 "Landmarks": "",
                 "OCR Text": "",
                 "Scene": "",
-                "Maps Link": ""
+                "Maps Link": "",
+                "Error": ""
             }
 
-            exif = extract_exif(tmp)
-            row["Has EXIF"] = exif.get("has_exif", False)
-            row["Risk"] = exif.get("privacy_risk", "LOW")
-
-            gps = exif.get("gps")
-            if gps and "latitude" in gps:
-                row["GPS"] = "YES"
-                row["Latitude"] = gps["latitude"]
-                row["Longitude"] = gps["longitude"]
-                row["Maps Link"] = gps["google_maps_url"]
-
-            device_info = exif.get("device", {})
-            row["Device"] = f"{device_info.get('make','')} {device_info.get('model','')}".strip()
-            row["Captured"] = exif.get("datetime", "") or ""
-
-            if run_vision and os.getenv("AZURE_VISION_KEY"):
-                with open(tmp, "rb") as fb:
-                    vis = analyse_image_from_bytes(fb.read(), f.name)
-                row["Faces"] = len(vis.get("faces", []))
-                lm = vis.get("landmarks", [])
-                row["Landmarks"] = ", ".join([l["name"] for l in lm]) if lm else ""
-                ocr = vis.get("ocr_text", [])
-                row["OCR Text"] = " | ".join(ocr[:3]) if ocr else ""
-                row["Scene"] = vis.get("description", "") or ""
-                if row["Risk"] == "LOW" and (row["Faces"] > 0 or row["Landmarks"]):
-                    row["Risk"] = "MEDIUM"
-
+            tmp = None
             try:
-                os.remove(tmp)
-            except Exception:
-                pass
+                f.seek(0)
+                tmp = save_upload(f)
+
+                exif = extract_exif(tmp)
+                row["Has EXIF"] = exif.get("has_exif", False)
+                row["Risk"] = exif.get("privacy_risk", "LOW")
+
+                gps = exif.get("gps")
+                if gps and "latitude" in gps:
+                    row["GPS"] = "YES"
+                    row["Latitude"] = gps["latitude"]
+                    row["Longitude"] = gps["longitude"]
+                    row["Maps Link"] = gps["google_maps_url"]
+
+                device_info = exif.get("device", {})
+                row["Device"] = f"{device_info.get('make','')} {device_info.get('model','')}".strip()
+                row["Captured"] = exif.get("datetime", "") or ""
+
+                if run_vision and os.getenv("AZURE_VISION_KEY"):
+                    try:
+                        with open(tmp, "rb") as fb:
+                            vis = analyse_image_from_bytes(fb.read(), f.name)
+                        row["Faces"] = len(vis.get("faces", []))
+                        lm = vis.get("landmarks", [])
+                        row["Landmarks"] = ", ".join([l["name"] for l in lm]) if lm else ""
+                        ocr = vis.get("ocr_text", [])
+                        row["OCR Text"] = " | ".join(ocr[:3]) if ocr else ""
+                        row["Scene"] = vis.get("description", "") or ""
+                        if row["Risk"] == "LOW" and (row["Faces"] > 0 or row["Landmarks"]):
+                            row["Risk"] = "MEDIUM"
+                    except Exception as ve:
+                        row["Error"] = f"Vision: {str(ve)[:80]}"
+            except Exception as e:
+                row["Error"] = str(e)[:120]
+            finally:
+                if tmp:
+                    try:
+                        os.remove(tmp)
+                    except Exception:
+                        pass
 
             rows.append(row)
             progress.progress((i + 1) / len(uploaded_files))
@@ -727,11 +914,13 @@ elif mode == "Bulk Image Scan":
 # ═══════════════════════════════════════════════════════════════════════════════
 # FOOTER
 # ═══════════════════════════════════════════════════════════════════════════════
-st.markdown("---")
 st.markdown(
-    '<div style="text-align:center; color:#888; font-size:0.75rem; padding:8px 0;">'
-    '&copy; 2026 Yatish Chaturvedi. All rights reserved. '
-    'Built for security awareness demonstrations.'
+    '<div style="text-align:center; color:#666; font-size:0.72rem; '
+    'padding:10px 16px; margin-top:18px; border-top:1px solid #ddd; '
+    'background:#fafafa; border-radius:4px; line-height:1.5;">'
+    '&copy; 2026 <strong>Yatish Chaturvedi</strong> &nbsp;&middot;&nbsp; '
+    'OSINT Image Analyser<br/>'
+    '<em>Disclaimer: This application is intended for demonstration purposes only.</em>'
     '</div>',
     unsafe_allow_html=True
 )

@@ -8,9 +8,10 @@ import json
 import base64
 import requests
 
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
+# Gemini if GEMINI_API_KEY is set, else Groq (modules/llm_provider.py). The names are
+# kept from the Groq-only version so the calls below read as before.
+from modules.llm_provider import LLM_KEY as GROQ_API_KEY, LLM_URL as GROQ_URL, LLM_MODEL, LLM_EXTRA
+GROQ_VISION_MODEL = LLM_MODEL
 
 SERPER_API_KEY = os.getenv("SERPER_API_KEY", "")
 SERPER_SEARCH_URL = "https://google.serper.dev/search"
@@ -60,7 +61,7 @@ def identify_people_via_vision(file_path: str, vision_context: dict = None) -> d
     }
 
     if not GROQ_API_KEY:
-        result["error"] = "GROQ_API_KEY not set."
+        result["error"] = "No AI key set — GEMINI_API_KEY or GROQ_API_KEY in .env."
         return result
 
     img_b64 = _image_to_base64(file_path)
@@ -100,10 +101,15 @@ Prior analysis:
 
 IMPORTANT: Do NOT guess identities from faces. Only name someone if you can read their name on a badge/tag/banner or are extremely certain from other context. Focus on what you can READ, not recognize.
 
+Also: if a WELL-KNOWN PUBLIC FIGURE (author, actor, politician, sportsperson) is present AND you can ground it in readable text in the image (e.g. their name on a book cover, poster, or banner they are next to) or you are extremely confident they are a public figure, list them under "public_figures". Do NOT name private individuals from their face.
+
 Return as JSON:
 {{
   "people": [
     {{"description": "brief description", "name_tag_text": "text from badge or null", "uniform_details": "rank/force/insignia or null", "role_inference": "inferred role", "confidence": "high/medium/low"}}
+  ],
+  "public_figures": [
+    {{"name": "full name", "basis": "the readable text or reason this is grounded (not face alone)", "note": "who they are in one line"}}
   ],
   "event": {{"type": "...", "name": "from banners if visible", "date": "if visible", "confidence": "high/medium/low"}},
   "venue": {{"type": "...", "name": "if visible", "country_indicators": "flags/language clues", "confidence": "high/medium/low"}},
@@ -121,6 +127,7 @@ Return as JSON:
             },
             json={
                 "model": GROQ_VISION_MODEL,
+                **LLM_EXTRA,
                 "messages": [
                     {
                         "role": "user",
@@ -150,6 +157,7 @@ Return as JSON:
             parsed = json.loads(json_str)
 
             result["people_identified"] = parsed.get("people", [])
+            result["public_figures"] = parsed.get("public_figures", [])
             result["event_identified"] = parsed.get("event")
             result["venue_identified"] = parsed.get("venue")
             result["text_found"] = parsed.get("text_found", [])
@@ -253,7 +261,7 @@ def chat_about_image(file_path: str, user_question: str, conversation_history: l
     Supports multi-turn conversation with history.
     """
     if not GROQ_API_KEY:
-        return "LLM not configured — set GROQ_API_KEY in .env"
+        return "LLM not configured — set GEMINI_API_KEY (or GROQ_API_KEY) in .env"
 
     img_b64 = _image_to_base64(file_path)
     media_type = _detect_media_type(file_path)
@@ -294,6 +302,7 @@ If asked to identify people, only name those you're genuinely confident about.""
             },
             json={
                 "model": GROQ_VISION_MODEL,
+                **LLM_EXTRA,
                 "messages": messages,
                 "temperature": 0.4,
                 "max_tokens": 800
